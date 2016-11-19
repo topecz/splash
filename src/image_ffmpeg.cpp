@@ -364,18 +364,43 @@ void Image_FFmpeg::readLoop()
         _startTime = Timer::getTime();
         auto previousTime = 0ull;
 
-        auto shouldContinueLoop = [&]() -> bool {
-            lock_guard<mutex> lock(_videoSeekMutex);
-            return _continueRead && av_read_frame(_avContext, &packet) >= 0;
-        };
-
-        while (shouldContinueLoop())
+        while (_continueRead)
         {
+            unique_lock<mutex> lockSeek(_videoSeekMutex);
+            if (av_read_frame(_avContext, &packet) < 0)
+                break;
+
+            int64_t currentTime = Timer::getTime() - _startTime;
+            int64_t timing = currentTime;
+
+            // Check whether we should show time frame now, later, or never
+            if (packet.pts != AV_NOPTS_VALUE)
+                timing = static_cast<uint64_t>((double)packet.pts * _timeBase * 1e6);
+
+            //
+            // After seeking in the video, we need to reset _startTime
+            if (_startTime == -1)
+            {
+                _startTime = Timer::getTime() - timing;
+                currentTime = Timer::getTime() - _startTime;
+            }
+
+            if (timing - currentTime < 0)
+            {
+#if HAVE_FFMPEG_3
+                av_packet_unref(&packet);
+#else
+                av_free_packet(&packet);
+#endif
+                continue;
+            }
+
+            lockSeek.unlock();
+
             // Reading the video
-            if (packet.stream_index == _videoStreamIndex && _videoSeekMutex.try_lock())
+            if (packet.stream_index == _videoStreamIndex)
             {
                 auto img = unique_ptr<ImageBuffer>();
-                uint64_t timing;
                 bool hasFrame = false;
 
                 //
@@ -404,18 +429,19 @@ void Image_FFmpeg::readLoop()
                         unsigned char* pixels = reinterpret_cast<unsigned char*>(img->data());
                         copy(buffer.begin(), buffer.end(), pixels);
 
-                        if (packet.pts != AV_NOPTS_VALUE)
+                        hasFrame = true;
+
 #if HAVE_FFMPEG_3 or HAVE_FFMPEG_2_8
-                            timing = static_cast<uint64_t>((double)av_frame_get_best_effort_timestamp(frame) * _timeBase * 1e6);
-#else
-                            timing = static_cast<uint64_t>((double)packet.pts * _timeBase * 1e6);
+                        if (packet.pts != AV_NOPTS_VALUE)
+                        {
+                            // Best effort timing is based on the previous frame. We don't want that when seeking
+                            int64_t bestEffortTiming = static_cast<uint64_t>((double)av_frame_get_best_effort_timestamp(frame) * _timeBase * 1e6);
+                            if (abs(bestEffortTiming - timing) < 1e6)
+                                timing = bestEffortTiming;
+                        }
 #endif
-                        else
-                            timing = 0.0;
                         // This handles repeated frames
                         timing += frame->repeat_pict * _timeBase * 0.5;
-
-                        hasFrame = true;
                     }
                 }
                 //
@@ -452,7 +478,7 @@ void Image_FFmpeg::readLoop()
 #else
                             av_free_packet(&packet);
 #endif
-                            return;
+                            continue;
                         }
 
                         spec.format = {textureFormat};
@@ -462,10 +488,6 @@ void Image_FFmpeg::readLoop()
 
                         if (hapDecodeFrame(packet.data, packet.size, img->data(), outputBufferBytes, textureFormat))
                         {
-                            if (packet.pts != AV_NOPTS_VALUE)
-                                timing = static_cast<uint64_t>((double)packet.pts * _timeBase * 1e6);
-                            else
-                                timing = 0.0;
 
                             hasFrame = true;
                         }
@@ -474,40 +496,16 @@ void Image_FFmpeg::readLoop()
 
                 if (hasFrame)
                 {
-                    // Add the frame size to the history
-                    _framesSize.push_back(img->getSize());
+                    auto waitTime = timing - currentTime;
+                    if (waitTime > 2000) // More than 2ms to wait? Then wait a bit.
+                        this_thread::sleep_for(chrono::microseconds(waitTime - 1000));
 
-                    lock_guard<mutex> lockFrames(_videoQueueMutex);
-                    _timedFrames.emplace_back();
-                    std::swap(_timedFrames[_timedFrames.size() - 1].frame, img);
-                    _timedFrames[_timedFrames.size() - 1].timing = timing;
+                    lock_guard<mutex> lock(_writeMutex);
+                    _elapsedTime = timing;
+                    std::swap(_bufferImage, img);
+                    _imageUpdated = true;
+                    updateTimestamp();
                 }
-
-                int timedFramesBuffered = _timedFrames.size();
-
-                _videoSeekMutex.unlock();
-#if HAVE_FFMPEG_3
-                av_packet_unref(&packet);
-#else
-                av_free_packet(&packet);
-#endif
-
-                // Check the current buffer size (sum of all frames in buffer)
-                int64_t totalBufferSize = accumulate(_framesSize.begin(), _framesSize.end(), (int64_t)0);
-
-                // Do not store more than a few frames in memory
-                // _maximumBufferSize is divided by 2 as another frame queue is held by the display loop
-                while (timedFramesBuffered > 0 && totalBufferSize > _maximumBufferSize / 2 && _continueRead)
-                {
-                    this_thread::sleep_for(chrono::milliseconds(5));
-                    lock_guard<mutex> lockSeek(_videoSeekMutex);
-                    lock_guard<mutex> lockQueue(_videoQueueMutex);
-                    timedFramesBuffered = _timedFrames.size();
-                }
-
-                // Clear the frame size history if the buffer has been swapped
-                if (timedFramesBuffered == 0)
-                    _framesSize.clear();
             }
 #if HAVE_PORTAUDIO
             // Reading the audio
@@ -530,22 +528,13 @@ void Image_FFmpeg::readLoop()
                     auto buffer = ResizableArray<uint8_t>((uint8_t*)frame->data[0], (uint8_t*)frame->data[0] + dataSize);
                     _speaker->addToQueue(buffer);
                 }
-
-#if HAVE_FFMPEG_3
-                av_packet_unref(&packet);
-#else
-                av_free_packet(&packet);
-#endif
             }
 #endif
-            else
-            {
 #if HAVE_FFMPEG_3
-                av_packet_unref(&packet);
+            av_packet_unref(&packet);
 #else
-                av_free_packet(&packet);
+            av_free_packet(&packet);
 #endif
-            }
         }
 
         seek(0); // Go back to the beginning of the file
