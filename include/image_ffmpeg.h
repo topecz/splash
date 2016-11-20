@@ -84,21 +84,7 @@ class Image_FFmpeg : public Image
     std::atomic_bool _loopOnVideo{true};
 
     std::thread _videoDisplayThread;
-    struct TimedFrame
-    {
-        std::unique_ptr<ImageBuffer> frame{};
-        int64_t timing{0ull}; // in us
-    };
-    std::deque<TimedFrame> _timedFrames;
-
-    // Frame size history, used to keep the frame buffer smaller than _maximumBufferSize
-    std::vector<int64_t> _framesSize{};
-    int64_t _maximumBufferSize{1 << 29};
-
-    std::mutex _videoQueueMutex;
     std::mutex _videoSeekMutex;
-    std::condition_variable _videoQueueCondition;
-
     std::atomic_bool _timeJump{false};
 
     bool _intraOnly{false};

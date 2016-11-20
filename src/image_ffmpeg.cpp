@@ -57,10 +57,6 @@ void Image_FFmpeg::freeFFmpegObjects()
     _clockTime = -1;
 
     _continueRead = false;
-    _videoQueueCondition.notify_one();
-
-    if (_videoDisplayThread.joinable())
-        _videoDisplayThread.join();
     if (_readLoopThread.joinable())
         _readLoopThread.join();
 
@@ -109,7 +105,6 @@ bool Image_FFmpeg::read(const string& filename)
 
     // Launch the loops
     _continueRead = true;
-    _videoDisplayThread = thread([&]() { videoDisplayLoop(); });
     _readLoopThread = thread([&]() { readLoop(); });
 
     return true;
@@ -370,6 +365,8 @@ void Image_FFmpeg::readLoop()
             if (av_read_frame(_avContext, &packet) < 0)
                 break;
 
+            //
+            // Timing stuff
             int64_t currentTime = Timer::getTime() - _startTime;
             int64_t timing = currentTime;
 
@@ -377,7 +374,6 @@ void Image_FFmpeg::readLoop()
             if (packet.pts != AV_NOPTS_VALUE)
                 timing = static_cast<uint64_t>((double)packet.pts * _timeBase * 1e6);
 
-            //
             // After seeking in the video, we need to reset _startTime
             if (_startTime == -1)
             {
@@ -385,7 +381,48 @@ void Image_FFmpeg::readLoop()
                 currentTime = Timer::getTime() - _startTime;
             }
 
-            if (timing - currentTime < 0)
+            // Master clock
+            int64_t clockAsMs;
+            bool clockIsPaused{false};
+            if (_useClock && Timer::get().getMasterClock<chrono::milliseconds>(clockAsMs, clockIsPaused))
+            {
+                float seconds = (float)clockAsMs / 1e3f + _shiftTime;
+                _clockTime = seconds * 1e6;
+            }
+
+            if (_paused || (clockIsPaused && _useClock))
+            {
+                _startTime = Timer::getTime() - _currentTime;
+                this_thread::sleep_for(chrono::milliseconds(2));
+                continue;
+            }
+            else if (_useClock && _clockTime != -1l)
+            {
+                auto delta = abs(_currentTime - _clockTime);
+                // If the difference between master clock and local clock is greater than 1.5 frames @30Hz, we adjust local clock
+                if (delta > 50000)
+                {
+                    _startTime = Timer::getTime() - _clockTime;
+                    _currentTime = _clockTime;
+                }
+            }
+
+            // If the gap is too big (more than 5sec), we seek through the video
+            int64_t waitTime = timing - currentTime;
+            if (abs(waitTime / 1e6) > 5.f)
+            {
+                if (!_timeJump) // We do not want more than one jump at a time...
+                {
+                    _timeJump = true;
+                    _elapsedTime = _currentTime / 1e6;
+                    SThread::pool.enqueueWithoutId([=]() {
+                        seek(_elapsedTime);
+                        _timeJump = false;
+                    });
+                }
+            }
+
+            if (waitTime < 0)
             {
 #if HAVE_FFMPEG_3
                 av_packet_unref(&packet);
@@ -435,6 +472,7 @@ void Image_FFmpeg::readLoop()
                         if (packet.pts != AV_NOPTS_VALUE)
                         {
                             // Best effort timing is based on the previous frame. We don't want that when seeking
+                            // TODO: this should be done by detecting the seek, but it seems to not be so straightforward
                             int64_t bestEffortTiming = static_cast<uint64_t>((double)av_frame_get_best_effort_timestamp(frame) * _timeBase * 1e6);
                             if (abs(bestEffortTiming - timing) < 1e6)
                                 timing = bestEffortTiming;
@@ -586,11 +624,9 @@ void Image_FFmpeg::seek(float seconds)
     }
     else
     {
-        lock_guard<mutex> lockQueue(_videoQueueMutex);
         // As seeking will no necessarily go to the desired timestamp, but to the closest i-frame,
         // we will set _startTime at the next frame in the videoDisplayLoop
         _startTime = -1;
-        _timedFrames.clear();
 #if HAVE_PORTAUDIO
         if (_speaker)
             _speaker->clearQueue();
@@ -599,121 +635,8 @@ void Image_FFmpeg::seek(float seconds)
 }
 
 /*************/
-void Image_FFmpeg::videoDisplayLoop()
-{
-    auto previousTime = 0;
-
-    while (_continueRead)
-    {
-        auto localQueue = deque<TimedFrame>();
-        {
-            lock_guard<mutex> lockFrames(_videoQueueMutex);
-            std::swap(localQueue, _timedFrames);
-        }
-
-        // This sets the start time after a seek
-        if (localQueue.size() > 0 && _startTime == -1)
-            _startTime = Timer::getTime() - localQueue[0].timing;
-
-        while (localQueue.size() > 0 && _continueRead)
-        {
-            // If seek, clear the local queue as the frames should not be shown
-            if (_startTime == -1)
-            {
-                localQueue.clear();
-                continue;
-            }
-
-            //
-            // Get the current master and local clocks
-            //
-            _currentTime = Timer::getTime() - _startTime;
-
-            float seekTiming = _intraOnly ? 1.f : 3.f; // Maximum diff for seek to happen when synced to a master clock
-
-            int64_t clockAsMs;
-            bool clockIsPaused{false};
-            if (_useClock && Timer::get().getMasterClock<chrono::milliseconds>(clockAsMs, clockIsPaused))
-            {
-                float seconds = (float)clockAsMs / 1e3f + _shiftTime;
-                _clockTime = seconds * 1e6;
-            }
-
-            //
-            // Show the frame at the right timing, according to clocks
-            //
-            TimedFrame& timedFrame = localQueue[0];
-            if (timedFrame.timing != 0ull)
-            {
-                if (_paused || (clockIsPaused && _useClock))
-                {
-                    _startTime = Timer::getTime() - _currentTime;
-                    this_thread::sleep_for(chrono::milliseconds(2));
-                    continue;
-                }
-                else if (_useClock && _clockTime != -1l)
-                {
-                    auto delta = abs(_currentTime - _clockTime);
-                    // If the difference between master clock and local clock is greater than 1.5 frames @30Hz, we adjust local clock
-                    if (delta > 50000)
-                    {
-                        _startTime = Timer::getTime() - _clockTime;
-                        _currentTime = _clockTime;
-                    }
-                }
-
-                // Compute the difference between next frame and the current clock
-                int64_t waitTime = timedFrame.timing - _currentTime;
-
-                // If the gap is too big, we seek through the video
-                if (abs(waitTime / 1e6) > seekTiming)
-                {
-                    if (!_timeJump) // We do not want more than one jump at a time...
-                    {
-                        _timeJump = true;
-                        _elapsedTime = _currentTime / 1e6;
-                        localQueue.clear();
-                        SThread::pool.enqueueWithoutId([=]() {
-                            seek(_elapsedTime);
-                            _timeJump = false;
-                        });
-                    }
-                    continue;
-                }
-
-                // Otherwise, wait for the right time to display the frame
-                if (waitTime > 2e3) // we don't wait if the frame is due for the next few ms
-                    this_thread::sleep_for(chrono::microseconds(waitTime));
-
-                _elapsedTime = timedFrame.timing;
-
-                lock_guard<mutex> lock(_writeMutex);
-                if (!_bufferImage)
-                    _bufferImage = unique_ptr<ImageBuffer>(new ImageBuffer());
-                std::swap(_bufferImage, timedFrame.frame);
-                _imageUpdated = true;
-                updateTimestamp();
-            }
-
-            localQueue.pop_front();
-        }
-    }
-}
-
-/*************/
 void Image_FFmpeg::registerAttributes()
 {
-    addAttribute("bufferSize",
-        [&](const Values& args) {
-            int64_t sizeMB = max(16, args[0].as<int>());
-            _maximumBufferSize = sizeMB * (int64_t)1048576;
-            return true;
-        },
-        [&]() -> Values { return {_maximumBufferSize / (int64_t)1048576}; },
-        {'n'});
-    setAttributeParameter("bufferSize", true, true);
-    setAttributeDescription("bufferSize", "Set the maximum buffer size for the video (in MB)");
-
     addAttribute("duration",
         [&](const Values& args) { return false; },
         [&]() -> Values {
