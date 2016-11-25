@@ -31,6 +31,7 @@ Mesh::~Mesh()
 void Mesh::init()
 {
     _type = "mesh";
+    _renderingPriority = Priority::MESH;
     registerAttributes();
 
     // If the root object weak_ptr is expired, this means that

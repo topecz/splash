@@ -206,16 +206,17 @@ class BaseObject
     enum class Priority
     {
         NO_RENDER = -1,
-        BLENDING = 10,
-        PRE_FILTER = 15,
-        FILTER = 20,
-        PRE_CAMERA = 25,
-        CAMERA = 30,
-        POST_CAMERA = 35,
-        WARP = 40,
-        GUI = 45,
-        WINDOW = 50,
-        POST_WINDOW = 55
+        MESH = 10,
+        BLENDING = 20,
+        PRE_FILTER = 25,
+        FILTER = 30,
+        PRE_CAMERA = 35,
+        CAMERA = 40,
+        POST_CAMERA = 45,
+        WARP = 50,
+        GUI = 55,
+        WINDOW = 60,
+        POST_WINDOW = 65
     };
 
   public:
