@@ -1007,6 +1007,10 @@ bool World::loadProject(string filename)
 
         _projectFilename = filename;
 
+        // Save blending state
+        auto blendingState = _blendingMode;
+        setAttribute("computeBlending", {"none"});
+
         // Now, we apply the configuration depending on the current state
         // Meaning, we replace objects with the same name, create objects with non-existing name,
         // and delete objects which are not in the partial config
@@ -1100,6 +1104,9 @@ bool World::loadProject(string filename)
                 idxAttr++;
             }
         }
+
+        // Reset blending state
+        addTask([=]() { setAttribute("computeBlending", {blendingState}); });
 
         return true;
     }
